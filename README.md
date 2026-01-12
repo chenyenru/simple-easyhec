@@ -75,7 +75,7 @@ pip install lerobot[feetech] # install lerobot to control the arm
 python -m easyhec.examples.real.so100 \
   --model-cfg ../sam2/configs/sam2.1/sam2.1_hiera_l.yaml --checkpoint ../sam2/checkpoints/sam2.1_hiera_large.pt \
   --early-stopping-steps 1000 \
-  --robot-id my_robot_id \
+  --robot-id so100leader \
   --realsense_camera_serial_id 146322070293
 ```
 

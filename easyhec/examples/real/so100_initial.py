@@ -9,21 +9,21 @@ import numpy as np
 import torch
 import tyro
 from lerobot.cameras.realsense import RealSenseCamera
-from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
+from lerobot.cameras.realsense.configuration_realsense import \
+    RealSenseCameraConfig
 from lerobot.motors.motors_bus import MotorNormMode
 from lerobot.robots.robot import Robot
-from lerobot.robots.so100_follower.config_so100_follower import SO100FollowerConfig
+from lerobot.robots.so100_follower.config_so100_follower import \
+    SO100FollowerConfig
 from lerobot.robots.so100_follower.so100_follower import SO100Follower
 from lerobot.robots.utils import make_robot_from_config
+from scipy.spatial.transform import Rotation as R
 from transforms3d.euler import euler2mat
 from urchin import URDF
 
 from easyhec import ROBOT_DEFINITIONS_DIR
 from easyhec.examples.real.base import Args
-from easyhec.optim.optimize import optimize
-from easyhec.segmentation.interactive import InteractiveSegmentation
 from easyhec.utils import visualization
-from easyhec.utils.camera_conversions import opencv2ros
 from easyhec.utils.utils_3d import merge_meshes
 
 
@@ -92,7 +92,7 @@ def create_real_robot(uid: str = "so100", robot_id: Optional[str] = None, realse
             # }
             # for intel realsense camera users you need to modify the serial number or name for your own hardware
             cameras={
-                "base_camera": RealSenseCameraConfig(serial_number_or_name=realsense_serial_number, fps=30, width=640, height=480)
+                "base_camera": RealSenseCameraConfig(serial_number_or_name=realsense_serial_number, fps=30, width=1280, height=720)
             },
             id=robot_id,
         )
@@ -127,10 +127,34 @@ def main(args: SO100Args):
 
         # the guess says we are at position xyz=[-0.4, 0.0, 0.4] and angle the camerea downwards by np.pi / 4 radians  or 45 degrees
         # note that this convention is more natural for robotics (follows the typical convention for ROS and various simulators), where +Z is moving up towards the sky, +Y is to the left, +X is forward
+        initial_extrinsic_guess[:3, :3] = euler2mat(np.pi/2, 0, -np.pi/3)
+        # initial_extrinsic_guess[:3, 3] = np.array([0.3890, -0.4271, -2.3615])
+        initial_extrinsic_guess[:3, 3] = np.array([-0.1, -0.3, 0.4]) # ver2
+        # z->x, -y->z, x->z
         initial_extrinsic_guess[:3, 3] = np.array([0.24, 0.065, 0.63]) # ver2
 
+        guess_transformation_matrix = np.array([
+            [-6.4700e-01,  6.4018e-01, -4.1420e-01],
+            [-5.3916e-01, -7.6822e-01, -3.4516e-01],
+            [-5.3916e-01,  1.4901e-08,  8.4220e-01],
+        ])
+        print("transformation matrix in euler")
+        r = R.from_matrix(guess_transformation_matrix)
+        print(r.as_euler('xyz', degrees=True))
+
+        initial_extrinsic_guess[:3, :3] = guess_transformation_matrix
         initial_extrinsic_guess[:3, :3] = euler2mat(5.32991492e-05,  3.26266428e+01, -1.40194676e+02)
         initial_extrinsic_guess[:3, :3] = euler2mat(-0.8,  39.95, -90.52)
+
+        # pose:  tensor([[[-6.4700e-01,  6.4018e-01, -4.1420e-01, -1.0000e-01],
+        #  [-5.3916e-01, -7.6822e-01, -3.4516e-01,  3.0000e-01],
+        #  [-5.3916e-01,  1.4901e-08,  8.4220e-01,  4.0000e-01],
+        #  [ 0.0000e+00,  0.0000e+00,  0.0000e+00,  1.0000e+00]]])
+        # initial_extrinsic_guess[:3, 3] = np.array([-0.4, 0.2, 0.25])
+
+
+
+        # initial_extrinsic_guess = ros2opencv(initial_extrinsic_guess)
 
         initial_extrinsic_guesses[k] = initial_extrinsic_guess
 
@@ -155,7 +179,6 @@ def main(args: SO100Args):
                 ]
             )
             intrinsics[cam_name] = intrinsic
-            print(f"Camera {cam_name} intrinsics:\n{repr(intrinsic)}")
 
 
 
@@ -203,9 +226,9 @@ def main(args: SO100Args):
             np.array([
                 0, 0, 0, np.pi / 2, np.pi / 2, 0.2
             ]),
-            np.array([
-                np.pi / 3, -np.pi / 6, 0, np.pi / 2, np.pi / 2, 0
-            ])
+            # np.array([
+            #     np.pi / 3, -np.pi / 6, 0, np.pi / 2, np.pi / 2, 0
+            # ])
         ]
         control_freq = 15
         max_radians_per_step = 0.05
@@ -256,65 +279,9 @@ def main(args: SO100Args):
         initial_extrinsic_guess = initial_extrinsic_guesses[k]
         intrinsic = intrinsics[k]
         images = image_dataset[k]
-        camera_mount_poses = None # TODO (stao): support this
-        camera_width = images.shape[2]
-        camera_height = images.shape[1]
-        
-        mask_path = Path(args.output_dir) / robot_id / k / "mask.npy"
-        if args.use_previous_captures and mask_path.exists():
-            print(f"Using previous mask from {mask_path}")
-            masks = np.load(mask_path)
-        else:
-            interactive_segmentation = InteractiveSegmentation(
-                segmentation_model="sam2",
-                segmentation_model_cfg=dict(
-                    checkpoint=args.checkpoint, model_cfg=args.model_cfg
-                ),
-            )
-            masks = interactive_segmentation.get_segmentation(images)
-            np.save(mask_path, masks)
-
-        ### run the optimization given the data ###
-        predicted_camera_extrinsic_opencv = (
-            optimize(
-                camera_intrinsic=torch.from_numpy(intrinsic).float().to(device),
-                masks=torch.from_numpy(masks).float().to(device),
-                link_poses_dataset=torch.from_numpy(link_poses_dataset).float().to(device),
-                initial_extrinsic_guess=torch.tensor(initial_extrinsic_guess)
-                .float()
-                .to(device),
-                meshes=meshes,
-                camera_width=camera_width,
-                camera_height=camera_height,
-                camera_mount_poses=(
-                    torch.from_numpy(camera_mount_poses).float().to(device)
-                    if camera_mount_poses is not None
-                    else None
-                ),
-                gt_camera_pose=None,
-                iterations=args.train_steps,
-                early_stopping_steps=args.early_stopping_steps,
-            )
-            .cpu()
-            .numpy()
-        )
-        predicted_camera_extrinsic_ros = opencv2ros(predicted_camera_extrinsic_opencv)
 
         ### Print predicted results ###
 
-        print("Predicted camera extrinsic")
-        print(f"OpenCV:\n{repr(predicted_camera_extrinsic_opencv)}")
-        print(f"ROS/SAPIEN/ManiSkill/Mujoco/Isaac:\n{repr(predicted_camera_extrinsic_ros)}")
-
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-        np.save(
-            Path(args.output_dir) / robot_id / k / "camera_extrinsic_opencv.npy",
-            predicted_camera_extrinsic_opencv,
-        )
-        np.save(
-            Path(args.output_dir) / robot_id / k / "camera_extrinsic_ros.npy",
-            predicted_camera_extrinsic_ros,
-        )
         np.save(Path(args.output_dir) / robot_id / k / "camera_intrinsic.npy", intrinsic)
 
         visualization.visualize_extrinsic_results(
@@ -323,9 +290,9 @@ def main(args: SO100Args):
             meshes=meshes,
             intrinsic=intrinsic,
             extrinsics=np.stack(
-                [initial_extrinsic_guess, predicted_camera_extrinsic_opencv]
+                [initial_extrinsic_guess]
             ),
-            masks=masks,
+            masks=None,
             labels=["Initial Extrinsic Guess", "Predicted Extrinsic"],
             output_dir=str(Path(args.output_dir) / robot_id / k),
         )
