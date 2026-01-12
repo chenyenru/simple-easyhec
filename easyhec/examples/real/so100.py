@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
+import pyrealsense2 as rs
 import torch
 import tyro
-from lerobot.cameras.realsense import RealSenseCamera
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 from lerobot.motors.motors_bus import MotorNormMode
 from lerobot.robots.robot import Robot
@@ -141,21 +142,61 @@ def main(args: SO100Args):
 
     # get camera intrinsics for realsense cameras.
     intrinsics = dict()
-    for cam_name, cam in robot.cameras.items():
-        if isinstance(cam, RealSenseCamera):
-            streams = cam.rs_profile.get_streams()
-            assert len(streams) == 1, "Only one stream per camera is supported at the moment and it must be the color steam. Make sure to not enable any other streams."
-            color_stream = streams[0]
-            color_intrinsics = color_stream.as_video_stream_profile().get_intrinsics()
-            intrinsic = np.array(
-                [
-                    [color_intrinsics.fx, 0, color_intrinsics.ppx],
-                    [0, color_intrinsics.fy, color_intrinsics.ppy],
-                    [0, 0, 1],
-                ]
-            )
-            intrinsics[cam_name] = intrinsic
-            print(f"Camera {cam_name} intrinsics:\n{repr(intrinsic)}")
+    # for cam_name, cam in robot.cameras.items():
+    #     if isinstance(cam, RealSenseCamera):
+    #         streams = cam.rs_profile.get_streams()
+    #         assert len(streams) == 1, "Only one stream per camera is supported at the moment and it must be the color steam. Make sure to not enable any other streams."
+    #         color_stream = streams[0]
+    #         color_intrinsics = color_stream.as_video_stream_profile().get_intrinsics()
+    #         intrinsic = np.array(
+    #             [
+    #                 [color_intrinsics.fx, 0, color_intrinsics.ppx],
+    #                 [0, color_intrinsics.fy, color_intrinsics.ppy],
+    #                 [0, 0, 1],
+    #             ]
+    #         )
+    #         intrinsics[cam_name] = intrinsic
+    #         print(f"Camera {cam_name} intrinsics:\n{repr(intrinsic)}")
+    config = rs.config()
+    pipeline = rs.pipeline()
+    ctx = rs.context()
+    devices = ctx.query_devices()
+    if len(devices) == 0:
+        raise RuntimeError("No RealSense devices found.")
+
+    # Configure streams
+    camera_width = 640
+    camera_height = 480
+    if args.realsense_camera_serial_id == "none":
+        print("No realsense camera serial id provided, using the first device found")
+        realsense_camera_serial_id = devices[0].get_info(rs.camera_info.serial_number)
+    else:
+        realsense_camera_serial_id = args.realsense_camera_serial_id
+    print(f"RealSense device id: {realsense_camera_serial_id}")
+    config.enable_device(realsense_camera_serial_id)
+    config.enable_stream(
+        rs.stream.infrared, 1, camera_width, camera_height, rs.format.y8, 30
+    )
+    # Get the color stream profile and its intrinsics
+    profile = pipeline.start(config)
+    depth_device = profile.get_device()
+    depth_sensor = depth_device.query_sensors()[0]
+    depth_sensor.set_option(rs.option.emitter_enabled, 0)
+    left_infrared_stream = profile.get_stream(rs.stream.infrared)
+
+
+
+
+    ### Fetch Intrinsics ###
+    infrared_intrinsics = left_infrared_stream.as_video_stream_profile().get_intrinsics()
+    intrinsics["base_camera"] = np.array(
+        [
+            [infrared_intrinsics.fx, 0, infrared_intrinsics.ppx],
+            [0, infrared_intrinsics.fy, infrared_intrinsics.ppy],
+            [0, 0, 1],
+        ],
+        dtype=np.float32,
+    )
 
 
 
@@ -233,8 +274,12 @@ def main(args: SO100Args):
                 time.sleep(1 / control_freq - dt_s)
             time.sleep(1) # give some time for the robot to settle, cheap arms don't hold up as well
             qpos_dict = get_qpos(robot, flat=False)
-            for cam_name, cam in robot.cameras.items():
-                image_dataset[cam_name].append(cam.async_read())
+            # for cam_name, cam in robot.cameras.items():
+            #     image_dataset[cam_name].append(cam.async_read())
+            frames = pipeline.wait_for_frames()
+            left_frame = np.asanyarray(frames.get_infrared_frame(1).get_data())
+            image = cv2.cvtColor(left_frame, cv2.COLOR_GRAY2RGB)
+            image_dataset["base_camera"].append(image)
                 
             # get link poses
             cfg = dict()
